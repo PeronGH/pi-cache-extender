@@ -15,9 +15,9 @@ pi install ./pi-cache-extender
 Configure the return curve per session with `/cache-ttl` or at startup via `--cache-ttl`:
 
 ```text
-/cache-ttl 12m 60m   # 90% chance still needed at 12m, 10% at 60m (default)
+/cache-ttl 1.5m 3h   # 90% chance still needed at 1.5m, 10% at 3h (default)
 /cache-ttl 30m       # 50% half-life at 30m
 /cache-ttl off       # fall back to pi's built-in cache warmer
-/cache-ttl reset     # restore 12m -> 60m default
+/cache-ttl reset     # restore the default
 /cache-ttl           # show current curve, next refresh, and session warm cost
 ```

@@ -225,7 +225,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("cache-ttl", {
 		description: "Configure cache return curve (e.g. /cache-ttl 12m 60m, 30m, off, reset)",
 		getArgumentCompletions: (prefix) => {
-			const presets = ["12m 60m", "15m 90m", "30m", "off", "reset"];
+			const presets = ["1.5m 3h", "15m 90m", "30m", "off", "reset"];
 			const filtered = presets
 				.filter((item) => item.startsWith(prefix.trim().toLowerCase()))
 				.map((item) => ({ value: item, label: item }));

@@ -42,7 +42,11 @@ export function fromHalfLife(t50Ms: number, k = 2): CurveSpec {
 	return { mode: "curve", t90Ms, t10Ms, t50Ms, k };
 }
 
-export const DEFAULT_CONFIG: CurveSpec = fromTwoPoints(12 * 60_000, 60 * 60_000);
+/**
+ * Fitted to about 3,800 idle gaps from eight weeks of pi sessions: of the curves tried, this one's refresh counts cost
+ * least across the refresh-to-miss price ratios of current Claude models (0.02, 0.04 and 0.09).
+ */
+export const DEFAULT_CONFIG: CurveSpec = fromTwoPoints(90_000, 3 * 3_600_000);
 
 export function survivalAt(tMs: number, t50Ms: number, k: number): number {
 	if (tMs <= 0) return 1;

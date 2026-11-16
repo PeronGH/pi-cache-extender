@@ -61,7 +61,7 @@ describe("command and duration parsing", () => {
 		expect(formatDuration(45_000)).toBe("45s");
 		expect(formatDuration(270_000)).toBe("4m30s");
 		expect(formatDuration(3_600_000)).toBe("1h");
-		expect(formatCurveSummary(DEFAULT_CONFIG)).toBe("12m -> 1h");
+		expect(formatCurveSummary(DEFAULT_CONFIG)).toBe("1m30s -> 3h");
 	});
 
 	test("parses /cache-ttl arguments", () => {

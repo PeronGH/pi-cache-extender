@@ -1,7 +1,7 @@
 {
 	"name": "pi-cache-extender",
 	"version": "0.1.0",
-	"description": "Extends Anthropic prompt cache lifetime using a 2-point return curve and zero-output refresh pings",
+	"description": "Keeps Anthropic prompt caches warm in pi using a 2-point return curve instead of a fixed idle cap",
 	"type": "module",
 	"license": "MIT",
 	"keywords": [

@@ -1,15 +1,13 @@
+import { CACHE_WARMING_MAX_AGE_MS, evaluateCacheWarming } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type CapturedAnthropicRequest, isReplayableAnthropicPayload, sendWarmPing } from "../src/anthropic.ts";
+import { type CapturedRequest, captureRequest, sendWarmPing } from "../src/anthropic.ts";
 import {
 	type CacheExtenderConfig,
-	computeCacheEconomics,
 	DEFAULT_CONFIG,
-	evaluateOptimalStopping,
 	formatCurveSummary,
 	formatDuration,
-	getRefreshSchedule,
 	parseCommandArgs,
-	type StoppingDecision,
+	plannedRefreshes,
 } from "../src/policy.ts";
 
 const ENTRY_TYPE = "cache-extender-config";
@@ -40,282 +38,188 @@ function formatCost(usd: number): string {
 	return `$${usd.toFixed(3)}`;
 }
 
+/** Prompt size of the most recent request on the branch that reported usage. */
+function lastPromptTokens(ctx: ExtensionContext): number {
+	const branch = ctx.sessionManager.getBranch();
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		const { input, cacheRead, cacheWrite } = entry.message.usage;
+		if (input + cacheRead + cacheWrite > 0) return input + cacheRead + cacheWrite;
+	}
+	return 0;
+}
+
 export default function (pi: ExtensionAPI) {
 	let config: CacheExtenderConfig = DEFAULT_CONFIG;
 	let configSource: ConfigSource = "default";
-	let snapshot: CapturedAnthropicRequest | undefined;
-	let promptTokens = 0;
-	let phase: "streaming" | "idle" = "idle";
-	let inActiveTurn = false;
-	let idleSince = 0;
+	/** The latest agent request, while this extension owns warming its cache entry. */
+	let request: CapturedRequest | undefined;
+	/** When `request` was sent. */
+	let requestedAt = 0;
+	/** Start of the last request that read or wrote the cache entry, which is when its lifetime restarted. */
+	let touchedAt = 0;
+	/** Undefined while an agent run is active. */
+	let idleSince: number | undefined;
 	let nextWarmAt = 0;
-	let refreshDeadlineAt = 0;
-	let warmCount = 0;
-	let totalWarmCost = 0;
-	let lastDecision: StoppingDecision | undefined;
-	let stopReason: string | undefined;
-	let forceOneToken = false;
-	let sessionEpoch = 0;
 	let warmTimer: ReturnType<typeof setTimeout> | undefined;
 	let inFlight: AbortController | undefined;
+	let stopReason: string | undefined;
+	let warmCount = 0;
+	let totalWarmCost = 0;
 
 	pi.registerFlag("cache-ttl", {
 		description: "Cache return curve (e.g. '12m 60m', '30m', 'off')",
 		type: "string",
 	});
 
-	const clearTimers = () => {
-		if (warmTimer) {
-			clearTimeout(warmTimer);
-			warmTimer = undefined;
-		}
-		if (inFlight) {
-			inFlight.abort();
-			inFlight = undefined;
-		}
-		nextWarmAt = 0;
-		refreshDeadlineAt = 0;
-	};
-
-	const stopWarming = (reason?: string) => {
-		clearTimers();
-		lastDecision = undefined;
+	const stop = (reason?: string) => {
+		clearTimeout(warmTimer);
+		warmTimer = undefined;
+		inFlight?.abort();
+		inFlight = undefined;
 		stopReason = reason;
 	};
 
-	const getModelTtlMs = (req: CapturedAnthropicRequest): number | undefined => {
-		const seconds = req.model.promptCache?.short;
-		return seconds && seconds > 0 ? seconds * 1000 : undefined;
+	const forget = (reason?: string) => {
+		request = undefined;
+		stop(reason);
 	};
 
-	const computeDecision = (req: CapturedAnthropicRequest): StoppingDecision | undefined => {
-		if (config.mode === "off") return undefined;
-		const ttlMs = getModelTtlMs(req);
-		if (ttlMs === undefined) return undefined;
-		const schedule = getRefreshSchedule(ttlMs);
-		if (!schedule) return undefined;
-		if (phase === "streaming") {
-			return {
-				shouldWarm: true,
-				continuationProb: 1,
-				expectedSavings: 0,
-				cutoffIdleMs: schedule.ttlMs,
-				remainingPings: 1,
-			};
+	/** Number of refreshes worth sending from time `at` on, or the reason to send none. */
+	const plan = (ctx: ExtensionContext, target: CapturedRequest, at: number): number | string => {
+		if (config.mode === "off") return "off";
+		if (idleSince === undefined) {
+			// The agent will send its next request for sure, unless a tool hangs: bound that like pi does.
+			const remainingMs = requestedAt + CACHE_WARMING_MAX_AGE_MS - at;
+			return remainingMs >= 0 ? Math.floor(remainingMs / target.delayMs) + 1 : "run active for over an hour";
 		}
-		if (promptTokens <= 0) return undefined;
-		const economics = computeCacheEconomics(req.model, promptTokens, forceOneToken ? 1 : 0);
-		if (!economics.available) return undefined;
-		const elapsedIdle = Math.max(0, Date.now() - idleSince);
-		return evaluateOptimalStopping(
-			config,
-			elapsedIdle,
-			schedule.delayMs,
-			schedule.ttlMs,
-			economics.warmCost,
-			economics.missCost,
+		const economics = evaluateCacheWarming(target.model, lastPromptTokens(ctx), "idle");
+		if (!economics.economicsAvailable) return "cache economics unavailable";
+		return (
+			plannedRefreshes(config, at - idleSince, target.delayMs, economics.warmCost, economics.missCost) ||
+			"past curve horizon"
 		);
 	};
 
-	const scheduleNext = (ctx: ExtensionContext, epoch: number) => {
-		clearTimers();
-		stopReason = undefined;
-		if (epoch !== sessionEpoch || config.mode === "off" || !snapshot) return;
-		const currentSnapshot = snapshot;
-		const ttlMs = getModelTtlMs(currentSnapshot);
-		const schedule = ttlMs !== undefined ? getRefreshSchedule(ttlMs) : undefined;
-		if (!schedule) {
-			stopReason = "no cache TTL";
+	/** Arm the refresh that is due before the cache entry of `request` expires. */
+	const schedule = (ctx: ExtensionContext, target: CapturedRequest) => {
+		stop();
+		nextWarmAt = touchedAt + target.delayMs;
+		// A timer can run late after sleep. Past half of the pre-expiry margin the entry has likely expired, and the
+		// refresh would be a full-price cache write.
+		const deadline = nextWarmAt + Math.floor((target.ttlMs - target.delayMs) / 2);
+		if (Date.now() > deadline) {
+			stop("cache expired");
 			return;
 		}
-		if (phase === "idle" && promptTokens > 0) {
-			lastDecision = computeDecision(currentSnapshot);
-			if (lastDecision && !lastDecision.shouldWarm) {
-				stopWarming("past curve horizon");
-				return;
-			}
-		}
-
-		nextWarmAt = Date.now() + schedule.delayMs;
-		refreshDeadlineAt = nextWarmAt + schedule.graceMs;
-		warmTimer = setTimeout(() => void runWarm(ctx, currentSnapshot, epoch), schedule.delayMs);
+		warmTimer = setTimeout(() => void warm(ctx, target, deadline), Math.max(0, nextWarmAt - Date.now()));
 		warmTimer.unref?.();
 	};
 
-	const runWarm = async (ctx: ExtensionContext, targetSnapshot: CapturedAnthropicRequest, epoch: number) => {
+	// Every change of `request` clears the timer and aborts the refresh in flight, so `target` is current here.
+	const warm = async (ctx: ExtensionContext, target: CapturedRequest, deadline: number) => {
 		warmTimer = undefined;
-		if (
-			epoch !== sessionEpoch ||
-			config.mode === "off" ||
-			snapshot !== targetSnapshot ||
-			ctx.model?.id !== targetSnapshot.model.id
-		) {
-			stopWarming();
-			return;
-		}
-		if (Date.now() > refreshDeadlineAt) {
-			stopWarming("missed refresh window");
-			return;
-		}
-
-		const decision = computeDecision(targetSnapshot);
-		lastDecision = decision;
-		if (phase === "idle" && !decision?.shouldWarm) {
-			stopWarming("past curve horizon");
+		const startedAt = Date.now();
+		const planned = startedAt > deadline ? "cache expired" : plan(ctx, target, startedAt);
+		if (typeof planned === "string") {
+			stop(planned);
 			return;
 		}
 
 		const controller = new AbortController();
 		inFlight = controller;
+		// A rejection here would be unhandled and take pi down with it.
+		const message = await sendWarmPing(ctx.modelRegistry, target, controller.signal).catch(() => undefined);
+		if (inFlight !== controller) return;
+		inFlight = undefined;
 
-		try {
-			let result = await sendWarmPing(ctx.modelRegistry, targetSnapshot, controller.signal, forceOneToken ? 1 : 0);
-			if (
-				result.rejectedZeroMaxTokens &&
-				!controller.signal.aborted &&
-				epoch === sessionEpoch &&
-				snapshot === targetSnapshot
-			) {
-				forceOneToken = true;
-				result = await sendWarmPing(ctx.modelRegistry, targetSnapshot, controller.signal, 1);
-			}
-			if (inFlight !== controller || epoch !== sessionEpoch) return;
-			inFlight = undefined;
-
-			if (!result.ok || snapshot !== targetSnapshot) {
-				stopWarming(result.errorMessage ?? "request failed");
-				return;
-			}
-			if (result.usage) {
-				// If the server wrote a new cache entry without reading, the prefix already expired.
-				if (result.usage.cacheWrite > 0 && result.usage.cacheRead === 0) {
-					stopWarming("cache expired");
-					return;
-				}
-				warmCount++;
-				totalWarmCost += result.usage.cost.total;
-			}
-			scheduleNext(ctx, epoch);
-		} catch {
-			if (inFlight === controller) inFlight = undefined;
-			if (epoch === sessionEpoch) stopWarming("request error");
+		if (!message || message.stopReason === "error" || message.stopReason === "aborted") {
+			stop(message?.errorMessage ?? "refresh failed");
+			return;
 		}
+		warmCount++;
+		totalWarmCost += message.usage.cost.total;
+		if (message.usage.cacheRead === 0) {
+			stop("cache expired");
+			return;
+		}
+		touchedAt = startedAt;
+		schedule(ctx, target);
 	};
 
-	const restoreConfigFromBranch = (ctx: ExtensionContext) => {
-		let nextConfig: CacheExtenderConfig = DEFAULT_CONFIG;
-		let nextSource: ConfigSource = "default";
+	const restoreConfig = (ctx: ExtensionContext) => {
+		config = DEFAULT_CONFIG;
+		configSource = "default";
 		const flagValue = pi.getFlag("cache-ttl");
-		if (typeof flagValue === "string" && flagValue.trim().length > 0) {
+		if (typeof flagValue === "string") {
 			const parsedFlag = parseCommandArgs(flagValue);
 			if (parsedFlag.action === "set") {
-				nextConfig = parsedFlag.config;
-				nextSource = "flag";
+				config = parsedFlag.config;
+				configSource = "flag";
 			}
 		}
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === ENTRY_TYPE && isValidConfig(entry.data)) {
-				nextConfig = entry.data;
-				nextSource = "session";
+				config = entry.data;
+				configSource = "session";
 			}
 		}
-		config = nextConfig;
-		configSource = nextSource;
 	};
 
-	const resetRuntimeState = () => {
-		sessionEpoch++;
-		clearTimers();
-		snapshot = undefined;
-		promptTokens = 0;
-		phase = "idle";
-		inActiveTurn = false;
-		idleSince = 0;
-		warmCount = 0;
-		totalWarmCost = 0;
-		lastDecision = undefined;
-		stopReason = undefined;
+	const describeState = (ctx: ExtensionContext): string => {
+		if (config.mode === "off") return "off, pi's built-in warmer applies";
+		if (inFlight) return "refreshing now";
+		if (!request || !warmTimer) return stopReason ? `stopped (${stopReason})` : "waiting for a request";
+		const now = Date.now();
+		const wait = formatDuration(Math.max(0, nextWarmAt - now));
+		const planned = plan(ctx, request, nextWarmAt);
+		if (typeof planned === "string") return `stopping in ${wait} (${planned})`;
+		const warmUntil = nextWarmAt + (planned - 1) * request.delayMs + request.ttlMs;
+		return `next refresh in ${wait}, up to ${planned} planned, keeping the cache for ${formatDuration(warmUntil - now)}`;
 	};
 
-	pi.on("session_start", async (_event, ctx) => {
-		resetRuntimeState();
-		restoreConfigFromBranch(ctx);
+	pi.on("session_start", (_event, ctx) => {
+		restoreConfig(ctx);
 	});
 
-	pi.on("session_tree", async (_event, ctx) => {
-		resetRuntimeState();
-		restoreConfigFromBranch(ctx);
+	pi.on("session_tree", (_event, ctx) => {
+		forget();
+		restoreConfig(ctx);
 	});
 
-	pi.on("session_shutdown", async () => {
-		sessionEpoch++;
-		stopWarming();
+	pi.on("session_shutdown", () => {
+		stop();
 	});
 
-	pi.on("session_compact", async () => {
-		snapshot = undefined;
-		promptTokens = 0;
-		stopWarming("compacted");
+	pi.on("session_compact", () => {
+		forget("compacted");
 	});
 
-	pi.on("model_select", async (event) => {
-		if (snapshot && (event.model.provider !== snapshot.model.provider || event.model.id !== snapshot.model.id)) {
-			snapshot = undefined;
-			promptTokens = 0;
-			forceOneToken = false;
-			stopWarming("model changed");
+	pi.on("model_select", (event) => {
+		if (request && (event.model.provider !== request.model.provider || event.model.id !== request.model.id)) {
+			forget("model changed");
 		}
 	});
 
-	pi.on("turn_start", async () => {
-		inActiveTurn = true;
-		phase = "streaming";
-		idleSince = 0;
-	});
-
-	pi.on("turn_end", async () => {
-		inActiveTurn = false;
-	});
-
-	pi.on("before_provider_request", async (event, ctx) => {
-		if (config.mode === "off" || !inActiveTurn) return;
-		if (!isReplayableAnthropicPayload(event.payload, ctx.model)) return;
-		snapshot = {
-			model: ctx.model,
-			payload: structuredClone(event.payload) as Record<string, unknown>,
-			capturedAt: Date.now(),
-		};
-		scheduleNext(ctx, sessionEpoch);
-	});
-
-	pi.on("message_end", async (event) => {
-		if (event.message.role !== "assistant") return;
-		const usage = event.message.usage;
-		if (!usage) return;
-		const total = usage.input + usage.cacheRead + usage.cacheWrite;
-		if (total > 0) promptTokens = total;
-		if (snapshot && phase === "idle") {
-			lastDecision = computeDecision(snapshot);
-			if (lastDecision && !lastDecision.shouldWarm) stopWarming("past curve horizon");
+	pi.on("before_provider_request", (event, ctx) => {
+		idleSince = undefined;
+		if (config.mode === "off") return;
+		request = captureRequest(event.payload, ctx.model);
+		if (!request) {
+			stop("request cannot be replayed");
+			return;
 		}
+		requestedAt = touchedAt = Date.now();
+		schedule(ctx, request);
 	});
 
-	pi.on("agent_settled", async () => {
-		inActiveTurn = false;
-		phase = "idle";
+	pi.on("agent_settled", () => {
 		idleSince = Date.now();
-		if (!snapshot || config.mode === "off") return;
-		lastDecision = computeDecision(snapshot);
-		if (!lastDecision?.shouldWarm) {
-			stopWarming("past curve horizon");
-		}
 	});
 
-	pi.on("cache_warming_decision", async (_event, ctx) => {
-		// Suppress pi's built-in warmer for Anthropic models while this extension is active.
-		if (config.mode !== "off" && ctx.model?.api === "anthropic-messages") {
-			return { action: "stop" };
-		}
+	pi.on("cache_warming_decision", () => {
+		if (request) return { action: "stop" };
 	});
 
 	pi.registerCommand("cache-ttl", {
@@ -337,69 +241,30 @@ export default function (pi: ExtensionAPI) {
 				config = parsed.config;
 				configSource = "session";
 				pi.appendEntry(ENTRY_TYPE, config);
-				if (config.mode === "off") {
-					stopWarming();
-					ctx.ui.notify("Cache extender: off (using pi built-in warmer)", "info");
-					return;
-				}
-				if (snapshot) {
-					if (phase === "idle" && idleSince === 0) idleSince = snapshot.capturedAt;
-					scheduleNext(ctx, sessionEpoch);
-				}
+				// A pending refresh reads the new curve when it comes due. One that had stopped resumes only while
+				// the cache entry is still alive.
+				if (config.mode === "off") forget();
+				else if (request && !warmTimer && !inFlight) schedule(ctx, request);
 			}
 
-			const activeModel = snapshot?.model ?? ctx.model;
-			const lines: string[] = [];
-
-			if (config.mode === "off") {
-				lines.push(`Cache Extender: off (${configSource})`);
-			} else {
+			const lines = [
+				config.mode === "off"
+					? `Cache Extender: off (${configSource})`
+					: `Cache Extender: ${formatCurveSummary(config)} (${configSource}) — 90% @ ${formatDuration(config.t90Ms)}, 50% @ ${formatDuration(config.t50Ms)}, 10% @ ${formatDuration(config.t10Ms)}, k=${config.k.toFixed(2)}`,
+				`Status: ${describeState(ctx)}`,
+			];
+			if (request) {
+				const tokens = lastPromptTokens(ctx);
+				const economics = evaluateCacheWarming(request.model, tokens, "idle");
+				const costs = economics.economicsAvailable
+					? `, refresh ${formatCost(economics.warmCost)} vs miss ${formatCost(economics.missCost)}`
+					: "";
 				lines.push(
-					`Cache Extender: ${formatCurveSummary(config)} (${configSource}) — 90% @ ${formatDuration(config.t90Ms)}, 50% @ ${formatDuration(config.t50Ms)}, 10% @ ${formatDuration(config.t10Ms)}, k=${config.k.toFixed(2)}`,
+					`Cache: ${request.model.id}, ${tokens.toLocaleString()} tokens, ${formatDuration(request.ttlMs)} lifetime${costs}`,
 				);
 			}
-
-			let stateText = "idle";
-			if (config.mode === "off") {
-				stateText = "disabled";
-			} else if (inFlight) {
-				stateText = "warming now";
-			} else if (warmTimer && nextWarmAt > 0) {
-				const nextText = `next in ${formatDuration(Math.max(0, nextWarmAt - Date.now()))}`;
-				if (snapshot && promptTokens > 0) {
-					const d = computeDecision(snapshot) ?? lastDecision;
-					stateText =
-						d && d.remainingPings > 0
-							? `${nextText} | horizon ~${formatDuration(d.cutoffIdleMs)} (${d.remainingPings} pings max)`
-							: nextText;
-				} else {
-					stateText = nextText;
-				}
-			} else if (stopReason) {
-				stateText = `stopped (${stopReason})`;
-			}
-			lines.push(`Status: ${stateText}`);
-
-			if (activeModel) {
-				if (promptTokens > 0) {
-					const econ = computeCacheEconomics(activeModel, promptTokens, forceOneToken ? 1 : 0);
-					const econText = econ.available
-						? ` | warm ${formatCost(econ.warmCost)} vs miss ${formatCost(econ.missCost)}`
-						: "";
-					lines.push(`Model: ${activeModel.id} (${promptTokens.toLocaleString()} tokens${econText})`);
-				} else {
-					lines.push(`Model: ${activeModel.id}`);
-				}
-			}
-
-			if (warmCount > 0) {
-				lines.push(`Session warmed: ${warmCount}x (${formatCost(totalWarmCost)})`);
-			}
-
-			if (parsed.action === "status") {
-				lines.push("Usage: /cache-ttl [t90 t10 | t50 | off | reset]");
-			}
-
+			if (warmCount > 0) lines.push(`Session warmed: ${warmCount}x (${formatCost(totalWarmCost)})`);
+			if (parsed.action === "status") lines.push("Usage: /cache-ttl [t90 t10 | t50 | off | reset]");
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});

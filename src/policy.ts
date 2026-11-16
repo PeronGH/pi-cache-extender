@@ -1,5 +1,3 @@
-import { type Api, calculateCost, type Model, type Usage } from "@earendil-works/pi-ai";
-
 export interface CurveSpec {
 	mode: "curve";
 	t90Ms: number;
@@ -15,27 +13,16 @@ export type ParsedCommand =
 	| { action: "set"; config: CacheExtenderConfig }
 	| { action: "invalid"; message: string };
 
-export interface RefreshSchedule {
-	ttlMs: number;
-	delayMs: number;
-	graceMs: number;
-}
-
-export interface StoppingDecision {
-	shouldWarm: boolean;
-	continuationProb: number;
-	expectedSavings: number;
-	cutoffIdleMs: number;
-	remainingPings: number;
-}
-
 const LOG_09 = Math.log(0.9);
 const LOG_05 = Math.log(0.5);
 const LOG_01 = Math.log(0.1);
 const MIN_HORIZON_PROB = 0.002;
-const MAX_DP_STEPS = 400;
+const MAX_STEPS = 400;
 
-/** Fit a Weibull survival curve S(t) = 0.5^((t / t50)^k) from 90% and 10% return times. */
+/**
+ * Fit the return curve S(t) = 0.5^((t / t50)^k) through S(t90) = 0.9 and S(t10) = 0.1.
+ * S(t) is the chance that the user still comes back to the session after being idle for t.
+ */
 export function fromTwoPoints(t90Ms: number, t10Ms: number): CurveSpec {
 	if (!(Number.isFinite(t90Ms) && Number.isFinite(t10Ms) && t90Ms > 0 && t10Ms > t90Ms)) {
 		throw new Error("Expected 0 < t90 < t10");
@@ -45,7 +32,7 @@ export function fromTwoPoints(t90Ms: number, t10Ms: number): CurveSpec {
 	return { mode: "curve", t90Ms, t10Ms, t50Ms, k };
 }
 
-/** Fit a Weibull survival curve from half-life t50 and shape k (defaults to 2). */
+/** Return curve with S(t50) = 0.5 and shape k. */
 export function fromHalfLife(t50Ms: number, k = 2): CurveSpec {
 	if (!(Number.isFinite(t50Ms) && Number.isFinite(k) && t50Ms > 0 && k > 0)) {
 		throw new Error("Expected positive t50 and k");
@@ -62,99 +49,38 @@ export function survivalAt(tMs: number, t50Ms: number, k: number): number {
 	return 0.5 ** ((tMs / t50Ms) ** k);
 }
 
-/** Match pi's 90% / -10s pre-expiry timing with half the remaining margin as sleep grace. */
-export function getRefreshSchedule(ttlMs: number): RefreshSchedule | undefined {
-	if (ttlMs <= 10_000) return undefined;
-	const delayMs = Math.max(1, Math.floor(Math.min(ttlMs * 0.9, ttlMs - 10_000)));
-	const graceMs = Math.floor((ttlMs - delayMs) / 2);
-	return { ttlMs, delayMs, graceMs };
-}
-
-/** Compute single-refresh cost and cache-miss penalty using pi-ai's tiered calculateCost. */
-export function computeCacheEconomics(
-	model: Model<Api>,
-	promptTokens: number,
-	warmOutputTokens = 0,
-): { warmCost: number; missCost: number; available: boolean } {
-	if (promptTokens <= 0) return { warmCost: 0, missCost: 0, available: false };
-	const price = (tokens: Partial<Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite">>): number => {
-		const usage: Usage = {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			...tokens,
-		};
-		return calculateCost(model, usage).total;
-	};
-	const cacheHitCost = price({ cacheRead: promptTokens });
-	const cacheMissCost = price(model.cost.cacheWrite > 0 ? { cacheWrite: promptTokens } : { input: promptTokens });
-	const warmCost = price({ cacheRead: promptTokens, output: warmOutputTokens });
-	const missCost = Math.max(0, cacheMissCost - cacheHitCost);
-	return { warmCost, missCost, available: cacheHitCost > 0 || cacheMissCost > 0 };
-}
-
 /**
- * Backward dynamic programming optimal stopping rule over the Weibull curve.
- * Compares stopping now (losing q(t) * missCost) against warming now and acting optimally thereafter.
+ * Number of consecutive refreshes worth sending, one every `stepMs`, to a user who has been idle for `idleMs`.
+ *
+ * At idle time t the user returns within the next step with probability S(t) - S(t + step), later with S(t + step),
+ * and never with 1 - S(t). Stopping costs S(t) * missCost. Refreshing costs warmCost plus, unless the user returns
+ * within the step, the cheaper choice at t + step. Solved backward from where S becomes negligible.
  */
-export function evaluateOptimalStopping(
-	config: CurveSpec,
-	elapsedIdleMs: number,
+export function plannedRefreshes(
+	curve: CurveSpec,
+	idleMs: number,
 	stepMs: number,
-	ttlMs: number,
 	warmCost: number,
 	missCost: number,
-): StoppingDecision {
-	const start = Math.max(0, elapsedIdleMs);
-	const q0 = survivalAt(start, config.t50Ms, config.k);
-	if (missCost <= 0 || warmCost < 0 || stepMs <= 0) {
-		return {
-			shouldWarm: false,
-			continuationProb: q0,
-			expectedSavings: 0,
-			cutoffIdleMs: start,
-			remainingPings: 0,
-		};
-	}
-
+): number {
+	const survival = (step: number) => survivalAt(idleMs + step * stepMs, curve.t50Ms, curve.k);
 	let steps = 1;
-	while (steps < MAX_DP_STEPS && survivalAt(start + steps * stepMs, config.t50Ms, config.k) >= MIN_HORIZON_PROB) {
-		steps++;
+	while (steps < MAX_STEPS && survival(steps) >= MIN_HORIZON_PROB) steps++;
+
+	let laterCost = survival(steps) * missCost;
+	let refreshes = 0;
+	for (let step = steps - 1; step >= 0; step--) {
+		const stopCost = survival(step) * missCost;
+		const refreshCost = warmCost + (1 - (survival(step) - survival(step + 1))) * laterCost;
+		if (refreshCost < stopCost) {
+			refreshes++;
+			laterCost = refreshCost;
+		} else {
+			refreshes = 0;
+			laterCost = stopCost;
+		}
 	}
-
-	const warmFlags = new Array<boolean>(steps);
-	let nextValue = survivalAt(start + steps * stepMs, config.t50Ms, config.k) * missCost;
-	let rootSavings = 0;
-
-	for (let i = steps - 1; i >= 0; i--) {
-		const t = start + i * stepMs;
-		const q = survivalAt(t, config.t50Ms, config.k);
-		const qNext = survivalAt(t + stepMs, config.t50Ms, config.k);
-		const pReturn = Math.max(0, q - qNext);
-		const costStop = q * missCost;
-		const costWarm = warmCost + (1 - pReturn) * nextValue;
-		const warm = costWarm < costStop;
-		warmFlags[i] = warm;
-		nextValue = warm ? costWarm : costStop;
-		if (i === 0) rootSavings = costStop - costWarm;
-	}
-
-	let remainingPings = 0;
-	for (let i = 0; i < steps && warmFlags[i]; i++) {
-		remainingPings++;
-	}
-	const cutoffIdleMs = remainingPings > 0 ? start + (remainingPings - 1) * stepMs + ttlMs : start;
-
-	return {
-		shouldWarm: warmFlags[0] ?? false,
-		continuationProb: q0,
-		expectedSavings: rootSavings,
-		cutoffIdleMs,
-		remainingPings,
-	};
+	return refreshes;
 }
 
 export function parseDurationMs(token: string): number | undefined {

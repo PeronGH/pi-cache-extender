@@ -1,16 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import type { Model } from "@earendil-works/pi-ai";
+import { evaluateCacheWarming, type Model } from "@earendil-works/pi-ai";
 import {
-	computeCacheEconomics,
 	DEFAULT_CONFIG,
-	evaluateOptimalStopping,
 	formatCurveSummary,
 	formatDuration,
 	fromHalfLife,
 	fromTwoPoints,
-	getRefreshSchedule,
 	parseCommandArgs,
 	parseDurationMs,
+	plannedRefreshes,
 	survivalAt,
 } from "../src/policy.ts";
 
@@ -88,56 +86,27 @@ describe("command and duration parsing", () => {
 	});
 });
 
-describe("optimal stopping DP", () => {
-	test("keeps Fable 5.2 warm longer than Opus 5.5 and Haiku 5.5 under identical curve", () => {
-		const schedule = getRefreshSchedule(300_000);
-		expect(schedule).toBeDefined();
-		if (!schedule) return;
-		const fable = makeModel({ cost: { input: 8, output: 40, cacheRead: 0.2, cacheWrite: 10 } });
-		const opus = makeModel({ id: "claude-opus-5-5", cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 } });
-		const haiku = makeModel({
-			id: "claude-haiku-5-5",
-			cost: { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
-		});
+describe("plannedRefreshes", () => {
+	const STEP_MS = 270_000;
+	const planFor = (model: Model<"anthropic-messages">, idleMs: number) => {
+		const { warmCost, missCost } = evaluateCacheWarming(model, 50_000, "idle");
+		return plannedRefreshes(DEFAULT_CONFIG, idleMs, STEP_MS, warmCost, missCost);
+	};
 
-		const evalFor = (model: Model<"anthropic-messages">) => {
-			const econ = computeCacheEconomics(model, 50_000, 0);
-			return evaluateOptimalStopping(
-				DEFAULT_CONFIG,
-				4.5 * 60_000,
-				schedule.delayMs,
-				schedule.ttlMs,
-				econ.warmCost,
-				econ.missCost,
-			);
-		};
+	test("keeps a cache warm longer the more a miss costs relative to a refresh", () => {
+		const fable = planFor(makeModel(), STEP_MS);
+		const opus = planFor(makeModel({ cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 } }), STEP_MS);
+		const haiku = planFor(
+			makeModel({ cost: { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 } }),
+			STEP_MS,
+		);
 
-		const dFable = evalFor(fable);
-		const dOpus = evalFor(opus);
-		const dHaiku = evalFor(haiku);
-
-		expect(dFable.shouldWarm).toBe(true);
-		expect(dOpus.shouldWarm).toBe(true);
-		expect(dHaiku.shouldWarm).toBe(true);
-		expect(dFable.remainingPings).toBeGreaterThan(dOpus.remainingPings);
-		expect(dOpus.remainingPings).toBeGreaterThan(dHaiku.remainingPings);
+		expect(haiku).toBeGreaterThan(0);
+		expect(opus).toBeGreaterThan(haiku);
+		expect(fable).toBeGreaterThan(opus);
 	});
 
-	test("stops once past the curve tail", () => {
-		const schedule = getRefreshSchedule(300_000);
-		expect(schedule).toBeDefined();
-		if (!schedule) return;
-		const fable = makeModel();
-		const econ = computeCacheEconomics(fable, 50_000, 0);
-		const late = evaluateOptimalStopping(
-			DEFAULT_CONFIG,
-			90 * 60_000,
-			schedule.delayMs,
-			schedule.ttlMs,
-			econ.warmCost,
-			econ.missCost,
-		);
-		expect(late.shouldWarm).toBe(false);
-		expect(late.remainingPings).toBe(0);
+	test("plans nothing once past the curve tail", () => {
+		expect(planFor(makeModel(), 90 * 60_000)).toBe(0);
 	});
 });

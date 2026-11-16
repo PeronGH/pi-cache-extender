@@ -1,86 +1,56 @@
-import type { Api, Context, Model, Usage } from "@earendil-works/pi-ai";
+import { type Api, type AssistantMessage, getCacheWarmingDelayMs, type Model } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 
-export interface CapturedAnthropicRequest {
+/** A request whose prompt cache entry can be refreshed by replaying its payload. */
+export interface CapturedRequest {
 	model: Model<"anthropic-messages">;
 	payload: Record<string, unknown>;
-	capturedAt: number;
+	/** Lifetime of the cache entry the request wrote. */
+	ttlMs: number;
+	/** How long after a cache touch the next refresh is due. */
+	delayMs: number;
 }
 
-export interface WarmPingResult {
-	ok: boolean;
-	usage?: Usage;
-	rejectedZeroMaxTokens?: boolean;
-	errorMessage?: string;
-}
-
-function hasCacheControlValue(value: unknown): boolean {
-	if (!value || typeof value !== "object") return false;
-	if (Array.isArray(value)) return value.some(hasCacheControlValue);
-	const record = value as Record<string, unknown>;
-	if (record.cache_control && typeof record.cache_control === "object") return true;
-	return Object.values(record).some(hasCacheControlValue);
-}
-
-/** Verify the payload belongs to a cacheable Anthropic model and can be replayed with max_tokens: 0. */
-export function isReplayableAnthropicPayload(
-	payload: unknown,
-	model: Model<Api> | undefined,
-): model is Model<"anthropic-messages"> {
-	if (model?.api !== "anthropic-messages") return false;
-	if (!model.promptCache?.short || model.promptCache.short <= 0) return false;
-	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
-	const record = payload as Record<string, unknown>;
-	if (record.model !== model.id || !Array.isArray(record.messages)) return false;
-	// Budget-based extended thinking requires budget_tokens < max_tokens and cannot use max_tokens: 0.
-	const thinking = record.thinking;
-	if (thinking && typeof thinking === "object" && (thinking as Record<string, unknown>).type === "enabled") {
-		return false;
+function findCacheControl(value: unknown): Record<string, unknown> | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const cacheControl = (value as Record<string, unknown>).cache_control;
+	if (cacheControl && typeof cacheControl === "object") return cacheControl as Record<string, unknown>;
+	for (const child of Object.values(value)) {
+		const found = findCacheControl(child);
+		if (found) return found;
 	}
-	return (
-		hasCacheControlValue(record.system) || hasCacheControlValue(record.tools) || hasCacheControlValue(record.messages)
-	);
+	return undefined;
 }
 
-/** Clone a captured provider payload for a streaming zero-output warm replay via pi's SDK pipeline. */
-export function buildWarmPayload(payload: Record<string, unknown>, maxTokens = 0): Record<string, unknown> {
-	const next = structuredClone(payload);
-	delete next.thread;
-	next.max_tokens = maxTokens;
-	next.stream = true;
-	return next;
+/** Capture an agent request for replay, or undefined when a one-token replay cannot refresh its cache entry. */
+export function captureRequest(payload: unknown, model: Model<Api> | undefined): CapturedRequest | undefined {
+	if (model?.api !== "anthropic-messages" || !payload || typeof payload !== "object") return undefined;
+	const record = payload as Record<string, unknown>;
+	if (record.model !== model.id) return undefined;
+	// Budget-based thinking requires budget_tokens < max_tokens, so it rejects a one-token replay.
+	if ((record.thinking as { type?: unknown } | undefined)?.type === "enabled") return undefined;
+	// pi puts the same cache_control on every breakpoint, so the first one tells the retention tier.
+	const cacheControl = findCacheControl(record);
+	if (!cacheControl) return undefined;
+	const seconds = model.promptCache?.[cacheControl.ttl === "1h" ? "long" : "short"];
+	if (!seconds) return undefined;
+	const ttlMs = seconds * 1000;
+	const delayMs = getCacheWarmingDelayMs(ttlMs);
+	if (delayMs === undefined) return undefined;
+	return { model: model as Model<"anthropic-messages">, payload: structuredClone(record), ttlMs, delayMs };
 }
 
+/** Replay a captured request with a one-token output cap. The context is a placeholder; the payload is replaced. */
 export async function sendWarmPing(
 	modelRegistry: Pick<ModelRegistry, "streamSimple">,
-	snapshot: CapturedAnthropicRequest,
+	request: CapturedRequest,
 	signal: AbortSignal,
-	maxTokens = 0,
-): Promise<WarmPingResult> {
-	const dummyContext: Context = {
-		messages: [{ role: "user", content: "ping", timestamp: Date.now() }],
-	};
-	const message = await modelRegistry
-		.streamSimple(snapshot.model, dummyContext, {
-			maxTokens: 1,
-			maxRetries: 0,
-			disableContinuation: true,
-			signal,
-			onPayload: () => buildWarmPayload(snapshot.payload, maxTokens),
-		})
+): Promise<AssistantMessage> {
+	return modelRegistry
+		.streamSimple(
+			request.model,
+			{ messages: [{ role: "user", content: "ping", timestamp: Date.now() }] },
+			{ maxRetries: 0, signal, onPayload: () => ({ ...request.payload, max_tokens: 1 }) },
+		)
 		.result();
-
-	if (message.stopReason === "error" || message.stopReason === "aborted") {
-		const errorMessage = message.errorMessage ?? message.stopReason;
-		return {
-			ok: false,
-			rejectedZeroMaxTokens: maxTokens === 0 && /max_tokens/i.test(errorMessage),
-			errorMessage,
-		};
-	}
-
-	return {
-		ok: true,
-		usage: message.usage,
-	};
 }
